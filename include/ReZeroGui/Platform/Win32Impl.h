@@ -8,6 +8,8 @@
 #include <windows.h>
 #include <windowsx.h>
 
+#include <cstdint>
+
 #include <ReZeroGui/Input.h>
 #include <ReZeroGui/Context.h>
 
@@ -263,6 +265,12 @@ namespace ReZeroGui {
             case WM_SIZE: {
                 const std::uint32_t width = static_cast<std::uint32_t>(LOWORD(lParam));
                 const std::uint32_t height = static_cast<std::uint32_t>(HIWORD(lParam));
+                // 最小化也会送来一条 WM_SIZE，但客户区是空的。照着它更新的话，窗口被收起来的
+                // 那段时间里所有窗口的布局都会被压成 0x0 的显示尺寸，所以只发布真实的尺寸；
+                // 反正 Platform::Win32 每帧还会重新读一次客户区。
+                if (width == 0 || height == 0) {
+                    return false;
+                }
                 context.displaySize(Vector2(static_cast<float>(width), static_cast<float>(height)));
                 return false;
             }
@@ -271,5 +279,165 @@ namespace ReZeroGui {
                 return false;
             }
         }
+
+        //===----------------------------------------------------------------------===//
+        // 帧的生命周期
+        //===----------------------------------------------------------------------===//
+
+        /// 一个 Context 加一个 HWND 的逐帧杂务：Context::beginFrame(deltaTime) 要用的计时器，
+        /// 以及布局所依据的客户区尺寸。
+        ///
+        ///     ReZeroGui::Platform::Win32 platform;
+        ///     if (!platform.initialize(ctx, window)) {
+        ///         return 1;
+        ///     }
+        ///     // 窗口过程照旧把每条消息转发给 ctx，见 handleMessage()。
+        ///     uiContext = &ctx;
+        ///     for (;;) {
+        ///         // 消息循环归宿主：循环什么时候结束、队列还用来做什么，只有宿主知道。
+        ///         MSG message{};
+        ///         while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
+        ///             if (message.message == WM_QUIT) {
+        ///                 return 0;
+        ///             }
+        ///             ::TranslateMessage(&message);
+        ///             ::DispatchMessageW(&message);
+        ///         }
+        ///
+        ///         ctx.beginFrame(platform.newFrame(ctx));
+        ///         // 在这里声明窗口和控件
+        ///         ctx.endFrame();
+        ///         renderer.renderDrawData(ctx.drawItems());
+        ///         // present
+        ///     }
+        ///
+        /// newFrame() 只采样计时器、刷新显示尺寸；它刻意不抽消息队列、也不开帧，因为这两件事
+        /// 都该由宿主决定。
+        struct Win32 {
+            Win32() noexcept = default;
+            Win32(const Win32 &) = delete;
+            Win32 &operator=(const Win32 &) = delete;
+
+            /// 把 \p window 接到 \p context 上并启动计时器。进入循环之前调用一次即可。
+            ///
+            /// 没有窗口、或者拿不到可用的高精度计时器时返回 false，此时宿主不应进入帧循环。
+            [[nodiscard]] auto initialize(Context &context, HWND window) noexcept -> bool {
+                if (window == nullptr) {
+                    REZERO_ASSERT_MSG(false, "Platform::Win32::initialize() needs a window");
+                    return false;
+                }
+                if (Window != nullptr) {
+                    REZERO_ASSERT_MSG(false, "Platform::Win32::initialize() was already called");
+                    return false;
+                }
+
+                LARGE_INTEGER frequency{};
+                if (::QueryPerformanceFrequency(&frequency) == FALSE || frequency.QuadPart == 0) {
+                    // 本库支持的 Windows 都有性能计数器，走到这里说明机器本身已经出问题了。
+                    // 直接拒绝，好过让宿主跑一个 delta time 恒为 0 的循环。
+                    REZERO_ASSERT_MSG(false, "Platform::Win32::initialize(): no high resolution timer");
+                    return false;
+                }
+
+                Window = window;
+                Frequency = frequency.QuadPart;
+                PreviousCounter = readCounter();
+                // 首帧从这里量起，而不是从进程启动算起。
+                DeltaTime = 0.0f;
+
+                // 窗口这时已经建好了，客户区就是首帧的显示尺寸。
+                updateDisplaySize(context);
+                return true;
+            }
+
+            /// 忘掉窗口、清掉计时器状态。宿主在循环结束之后、Context 与窗口销毁之前调用。
+            void shutdown() noexcept {
+                Window = nullptr;
+                Frequency = 0;
+                PreviousCounter = 0;
+                DeltaTime = 0.0f;
+            }
+
+            /// 每帧调用一次，位置在宿主抽完自己的消息队列之后：采样计时器并刷新显示尺寸。
+            ///
+            /// 返回距上一次调用经过的秒数，也就是 Context::beginFrame() 要的那个值；事后
+            /// deltaTime() 读到的也是同一个值。
+            auto newFrame(Context &context) noexcept -> float {
+                if (Window == nullptr) {
+                    REZERO_ASSERT_MSG(false, "Platform::Win32::newFrame() before initialize()");
+                    return 0.0f;
+                }
+
+                const std::int64_t counter = readCounter();
+                // 两帧落在同一个计时器滴答里时 delta 正好是 0，界面读到的是"这一帧没花时间"：
+                // 这是对的，也是帧率再高也快不过计时器分辨率的原因。
+                DeltaTime = Frequency > 0 ? static_cast<float>(static_cast<double>(counter - PreviousCounter) /
+                                                               static_cast<double>(Frequency))
+                                          : 0.0f;
+                PreviousCounter = counter;
+
+                updateDisplaySize(context);
+                // Win32 的"鼠标离开"每次登记只报一次，所以要为下一次重新登记。每帧登记一遍是
+                // 幂等的，也正是它让 Input::isMouseFocused() 一直说的是真话。
+                trackMouseLeave();
+                return DeltaTime;
+            }
+
+            /// 读窗口的客户区，并作为 Context 的显示尺寸发布出去。
+            ///
+            /// 没东西可发布时返回 false——窗口已经没了，或者它最小化了、客户区是空的。后一种
+            /// 情况保留上一次的尺寸，正是它挡住了"最小化的窗口把布局压成 0x0"。
+            auto updateDisplaySize(Context &context) noexcept -> bool {
+                RECT client{};
+                if (Window == nullptr || ::GetClientRect(Window, &client) == FALSE) {
+                    return false;
+                }
+                const float width = static_cast<float>(client.right - client.left);
+                const float height = static_cast<float>(client.bottom - client.top);
+                if (width <= 0.0f || height <= 0.0f) {
+                    return false;
+                }
+                DisplaySize = Vector2(width, height);
+                context.displaySize(DisplaySize);
+                return true;
+            }
+
+            [[nodiscard]] auto window() const noexcept -> HWND { return Window; }
+
+            /// 最近两次 newFrame() 之间经过的秒数，也就是那次调用的返回值；交给
+            /// Context::beginFrame() 用。
+            [[nodiscard]] auto deltaTime() const noexcept -> float { return DeltaTime; }
+
+            /// 上一次 newFrame() 时的客户区尺寸，单位是像素。
+            [[nodiscard]] auto displaySize() const noexcept -> Vector2 { return DisplaySize; }
+
+            /// 窗口处于最小化：它什么都画不出来，宿主可以睡一会儿，而不是空转着跑没人看的帧。
+            [[nodiscard]] auto isMinimized() const noexcept -> bool {
+                return Window != nullptr && ::IsIconic(Window) != FALSE;
+            }
+
+          private:
+            /// 为下一次指针离开重新登记 WM_MOUSELEAVE。
+            void trackMouseLeave() noexcept {
+                TRACKMOUSEEVENT tracking{};
+                tracking.cbSize = sizeof(tracking);
+                tracking.dwFlags = TME_LEAVE;
+                tracking.hwndTrack = Window;
+                ::TrackMouseEvent(&tracking);
+            }
+
+            [[nodiscard]] static auto readCounter() noexcept -> std::int64_t {
+                LARGE_INTEGER counter{};
+                ::QueryPerformanceCounter(&counter);
+                return static_cast<std::int64_t>(counter.QuadPart);
+            }
+
+            HWND Window = nullptr;
+            /// 每秒多少个 tick，以及上一帧是从哪个 tick 开始的。
+            std::int64_t Frequency = 0;
+            std::int64_t PreviousCounter = 0;
+            float DeltaTime = 0.0f;
+            Vector2 DisplaySize;
+        };
     } // namespace Platform
 } // namespace ReZeroGui

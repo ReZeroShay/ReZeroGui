@@ -1,4 +1,3 @@
-#include <chrono>
 #include <cstdio>
 
 #include <ReZeroGui/ReZeroGui.h>
@@ -162,7 +161,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     dx11renderer = &renderer;
 
     ReZeroGui::Context ctx(allocatorView);
-    ctx.displaySize(ReZeroGui::Vector2(static_cast<float>(width), static_cast<float>(height)));
+
+    // 平台侧负责帧计时器和显示尺寸：initialize() 启动计时器并发布客户区大小，newFrame() 返回
+    // 本帧的 delta time 并保持尺寸最新。下面的消息循环仍旧归宿主自己。
+    ReZeroGui::Platform::Win32 platform;
+    if (!platform.initialize(ctx, window)) {
+        return 1;
+    }
 
     auto &font = ctx.fonts();
     font.loadDefaultFont();
@@ -182,11 +187,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ::ShowWindow(window, showCommand);
     ::UpdateWindow(window);
 
-    auto previousTime = std::chrono::steady_clock::now();
-    bool running = true;
-
     // The UI is immediate mode, so the host owns every widget's value.
+    bool running = true;
     while (running) {
+        // 消息循环留在宿主这一侧：平台只是做逐帧的杂务。
         MSG message{};
         while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
@@ -200,10 +204,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             break;
         }
 
-        const auto currentTime = std::chrono::steady_clock::now();
-        const auto deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
-        previousTime = currentTime;
-
         // Hosts that render a 3D scene would do it here; the UI is blended on top
         // of whatever the back buffer already holds, so give it a defined base.
         // Clear colors are 0..1 floats, not 0..255.
@@ -212,8 +212,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             hostDeviceContext->ClearRenderTargetView(hostRenderTargetView.Get(), clearColor);
         }
         // 一帧：beginFrame() 开帧，声明窗口/控件，endFrame() 收帧（重排窗口几何、产出
-        // DrawData、清掉本帧输入），然后再交给渲染器。
-        ctx.beginFrame(deltaTime);
+        // DrawData、清掉本帧输入），然后再交给渲染器。deltaTime 由平台按秒给出。
+        platform.newFrame(ctx);
+        ctx.beginFrame(platform.deltaTime());
         showExample(ctx);
         ctx.endFrame();
         dx11renderer->renderDrawData(ctx.drawItems());
@@ -221,6 +222,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     uiContext = nullptr;
+    platform.shutdown();
     dx11renderer->shutdown();
     return 0;
 }

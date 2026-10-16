@@ -1,11 +1,10 @@
 #define NOMINMAX
-#include <chrono>
 #include <cstdio>
 
 #include <ReZeroGui/ReZeroGui.h>
 #include <ReZeroGui/Ui.h>
 #include <ReZeroGui/Renderer/Dx12Impl.h>
-#include <ReZeroGui/Platform/win32Impl.h>
+#include <ReZeroGui/Platform/Win32Impl.h>
 #include <wrl/client.h>
 #include "../Example.h"
 
@@ -163,7 +162,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     dx12renderer = &renderer;
 
     ReZeroGui::Context ctx(allocatorView);
-    ctx.displaySize(ReZeroGui::Vector2(static_cast<float>(width), static_cast<float>(height)));
+
+    // 平台侧负责帧计时器和显示尺寸：initialize() 启动计时器并发布客户区大小，newFrame() 返回
+    // 本帧的 delta time 并保持尺寸最新。下面的消息循环仍旧归宿主自己。
+    ReZeroGui::Platform::Win32 platform;
+    if (!platform.initialize(ctx, window)) {
+        return 1;
+    }
 
     // The window procedure forwards messages to the context, which is also where
     // WM_SIZE updates the display size used for layout.
@@ -172,10 +177,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ::ShowWindow(window, showCommand);
     ::UpdateWindow(window);
 
-    auto previousTime = std::chrono::steady_clock::now();
     bool running = true;
-
     while (running) {
+        // 消息循环留在宿主这一侧：平台只是做逐帧的杂务。
         MSG message{};
         while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
@@ -189,11 +193,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             break;
         }
 
-        const auto currentTime = std::chrono::steady_clock::now();
-        const auto deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
-        previousTime = currentTime;
-
-        ctx.beginFrame(deltaTime);
+        ctx.beginFrame(platform.newFrame(ctx));
         showExample(ctx);
         ctx.endFrame();
 
@@ -205,6 +205,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     uiContext = nullptr;
+    platform.shutdown();
     renderer.shutdown();
     return 0;
 }

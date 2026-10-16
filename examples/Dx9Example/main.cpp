@@ -1,4 +1,3 @@
-#include <chrono>
 #include <cstdio>
 
 #include <ReZeroGui/ReZeroGui.h>
@@ -162,7 +161,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     dx9renderer = &renderer;
 
     ReZeroGui::Context ctx(allocatorView);
-    ctx.displaySize(ReZeroGui::Vector2(static_cast<float>(width), static_cast<float>(height)));
+
+    // 平台侧负责帧计时器和显示尺寸：initialize() 启动计时器并发布客户区大小，newFrame() 返回
+    // 本帧的 delta time 并保持尺寸最新。下面的消息循环仍旧归宿主自己。
+    ReZeroGui::Platform::Win32 platform;
+    if (!platform.initialize(ctx, window)) {
+        return 1;
+    }
 
     // The window procedure forwards messages to the context, which is also where
     // WM_SIZE updates the display size used for layout.
@@ -171,10 +176,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     ::ShowWindow(window, showCommand);
     ::UpdateWindow(window);
 
-    auto previousTime = std::chrono::steady_clock::now();
     bool running = true;
-
     while (running) {
+        // 消息循环留在宿主这一侧：平台只是做逐帧的杂务。
         MSG message{};
         while (::PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             if (message.message == WM_QUIT) {
@@ -188,10 +192,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
             break;
         }
 
-        const auto currentTime = std::chrono::steady_clock::now();
-        const auto deltaTime = std::chrono::duration<float>(currentTime - previousTime).count();
-        previousTime = currentTime;
-
         // Direct3D 9 draws nothing outside BeginScene/EndScene, so the host owns
         // the pair: the clear and the whole UI live inside one scene.
         hostDevice->BeginScene();
@@ -200,7 +200,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         // Clear colors are 0..1 floats, not 0..255.
         hostDevice->Clear(0, nullptr, D3DCLEAR_TARGET, D3DCOLOR_COLORVALUE(0.09f, 0.09f, 0.12f, 1.0f), 1.0f, 0);
 
-        ctx.beginFrame(deltaTime);
+        // deltaTime 由平台按秒给出，一帧一次。
+        ctx.beginFrame(platform.newFrame(ctx));
         showExample(ctx);
         ctx.endFrame();
 
@@ -210,6 +211,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     uiContext = nullptr;
+    platform.shutdown();
     renderer.shutdown();
     return 0;
 }
