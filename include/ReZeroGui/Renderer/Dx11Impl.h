@@ -19,15 +19,14 @@ namespace ReZeroGui {
     struct Dx11Renderer {
       public:
         Dx11Renderer(AllocatorView allocator) : textures(allocator) {}
-        void initialize(HWND hwnd, ID3D11Device *dev, IDXGISwapChain *swap) noexcept {
-            REZERO_ASSERT(hwnd != nullptr);
+        void initialize(ID3D11Device *dev, IDXGISwapChain *swap, ID3D11DeviceContext *context) noexcept {
             REZERO_ASSERT(dev != nullptr);
             REZERO_ASSERT(swap != nullptr);
+            REZERO_ASSERT(context != nullptr);
 
-            Hwnd = static_cast<HWND>(hwnd);
-            Device = static_cast<ID3D11Device *>(dev);
-            SwapChain = static_cast<IDXGISwapChain *>(swap);
-            Device->GetImmediateContext(&Context);
+            Device = dev;
+            SwapChain = swap;
+            Context = context;
             if (!createRenderTarget() || !createPipeline()) {
                 shutdown();
                 return;

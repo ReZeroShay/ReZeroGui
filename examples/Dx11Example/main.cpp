@@ -157,7 +157,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     CAllocator cAllocator{};
     ReZeroGui::AllocatorView allocatorView(cAllocator);
     ReZeroGui::Dx11Renderer renderer(allocatorView);
-    renderer.initialize(window, device.Get(), hostSwapChain.Get());
+    renderer.initialize(device.Get(), hostSwapChain.Get(), hostDeviceContext.Get());
     dx11renderer = &renderer;
 
     ReZeroGui::Context ctx(allocatorView);
